@@ -1,178 +1,92 @@
-import { useState } from "react";
-import { useAssemblyPostings } from "./hooks/useAssemblyPostings";
-import { useAwaitingDeliverPostings } from "./hooks/useAwaitingDeliverPostings";
-import { useArticleSearch } from "./hooks/useArticleSearch";
-import { useShipmentGroups } from "./hooks/useShipmentGroups";
-import { useGroupSearch } from "./hooks/useGroupSearch";
-import { SearchBar } from "./components/SearchBar";
-import { RefreshButton } from "./components/RefreshButton";
-import { ExportXlsxButton } from "./components/ExportXlsxButton";
-import { CreateShipmentButton } from "./components/CreateShipmentButton";
-import { CreateShipmentDialog } from "./components/CreateShipmentDialog";
-import { downloadDeliverSheet, createFolderInS3 } from "./services/assemblyApiService";
-import { PostingsList } from "./components/PostingsList";
-import { ShipmentGroupsList } from "./components/ShipmentGroupsList";
-import { TabBar } from "./components/TabBar";
-import { ErrorMessage } from "./components/ErrorMessage";
-import { LoadingSpinner } from "./components/LoadingSpinner";
-import { generateShipmentNumber } from "./utils/shipmentUtils";
+import { useState, useEffect } from "react";
+import { fetchCurrentUser, login as apiLogin, logout as apiLogout } from "./services/authApiService";
+import { LoginPage } from "./pages/LoginPage";
+import { AdminPanelPage } from "./pages/AdminPanelPage";
+import { UserPage } from "./pages/UserPage";
 import "./App.css";
 
-function App() {
-	const [activeTab, setActiveTab] = useState("assembly");
-	const [isShipmentDialogOpen, setIsShipmentDialogOpen] = useState(false);
+export function App() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
 
-	const {
-		assemblyPostings,
-		setAssemblyPostings,
-		isLoadingPostings,
-		postingsLoadError,
-		refreshPostings,
-	} = useAssemblyPostings();
+  // Check auth on mount
+  useEffect(() => {
+    fetchCurrentUser()
+      .then((user) => {
+        setCurrentUser(user || null);
+        setAuthChecked(true);
+      })
+      .catch(() => {
+        setCurrentUser(null);
+        setAuthChecked(true);
+      });
+  }, []);
 
-	const {
-		deliverPostings,
-		setDeliverPostings,
-		isLoadingDeliver,
-		deliverLoadError,
-		refreshDeliverPostings,
-	} = useAwaitingDeliverPostings();
+  const handleLogin = async (loginValue, password) => {
+    setLoginError("");
+    setLoginBusy(true);
+    try {
+      const data = await apiLogin(loginValue, password);
+      setCurrentUser(data.user);
+      setAuthChecked(true);
+    } catch (err) {
+      setLoginError(err.message || "Не удалось войти.");
+    } finally {
+      setLoginBusy(false);
+    }
+  };
 
-	const {
-		searchQuery: assemblySearch,
-		setSearchQuery: setAssemblySearch,
-		filteredPostings: filteredAssembly,
-	} = useArticleSearch(assemblyPostings);
+  const handleLogout = async () => {
+    try {
+      await apiLogout();
+    } catch {}
+    setCurrentUser(null);
+  };
 
-	const {
-		searchQuery: deliverSearch,
-		setSearchQuery: setDeliverSearch,
-		filteredPostings: filteredDeliver,
-	} = useArticleSearch(deliverPostings);
+  // 1. Auth not checked yet — show loading
+  if (!authChecked) {
+    return (
+      <div className="login-page">
+        <div className="login-card">
+          <h1 className="login-title">OZON FBS</h1>
+          <p className="login-subtitle">Проверяем доступ...</p>
+        </div>
+      </div>
+    );
+  }
 
-	// Группируем заказы по shipmentDate
-	const shipmentGroups = useShipmentGroups(deliverPostings);
+  // 2. Not logged in — show login
+  if (!currentUser) {
+    return (
+      <LoginPage
+        onLogin={handleLogin}
+        loginError={loginError}
+        loginBusy={loginBusy}
+      />
+    );
+  }
 
-	// Фильтруем группы по поисковому запросу
-	const filteredGroups = useGroupSearch(shipmentGroups, deliverSearch);
+  // 3. Role-based rendering
+  const role = currentUser.role;
 
-	const isLoading = activeTab === "assembly" ? isLoadingPostings : isLoadingDeliver;
-	const loadError = activeTab === "assembly" ? postingsLoadError : deliverLoadError;
-	const handleRefresh = activeTab === "assembly" ? refreshPostings : refreshDeliverPostings;
+  if (role === "super_admin" || role === "admin") {
+    return (
+      <AdminPanelPage
+        user={currentUser}
+        onLogout={handleLogout}
+      />
+    );
+  }
 
-	const handleCreateShipment = async ({ date, postings }) => {
-		try {
-			// Генерируем уникальный QR-код поставки
-			const shipmentNumber = generateShipmentNumber();
-
-			// Создаем папку в S3 с датой и QR-кодом поставки
-			await createFolderInS3(date, shipmentNumber);
-
-			// Получаем postingNumbers для удаления из сборки
-			const postingNumbersToMove = new Set(postings.map((p) => p.postingNumber));
-
-			// Удаляем из assemblyPostings
-			const updatedAssembly = assemblyPostings.filter(
-				(p) => !postingNumbersToMove.has(p.postingNumber)
-			);
-			setAssemblyPostings(updatedAssembly);
-
-			// Добавляем shipmentDate и shipmentNumber к каждому posting
-			const postingsWithShipment = postings.map(p => ({
-				...p,
-				shipmentDate: date,
-				shipmentNumber: shipmentNumber
-			}));
-			setDeliverPostings([...deliverPostings, ...postingsWithShipment]);
-
-			// Закрываем диалог
-			setIsShipmentDialogOpen(false);
-		} catch (error) {
-			console.error("Ошибка при создании поставки:", error);
-			alert(`Ошибка при создании поставки: ${error.message}`);
-		}
-	};
-
-	return (
-		<div className="app-container">
-			<header className="app-header">
-				<h1 className="app-title">Заказы OZON (FBS)</h1>
-				<div className="app-header-actions">
-					<RefreshButton
-						onRefresh={handleRefresh}
-						isLoading={isLoading}
-					/>
-					{activeTab === "deliver" && (
-						<ExportXlsxButton
-							onDownload={downloadDeliverSheet}
-							label="Лист отгрузки"
-							title="Скачать лист отгрузки в Excel"
-						/>
-					)}
-				</div>
-			</header>
-
-			<TabBar
-				activeTab={activeTab}
-				onTabChange={setActiveTab}
-				assemblyCount={assemblyPostings.length}
-				deliverCount={deliverPostings.length}
-			/>
-
-			<section className="search-section no-print">
-				<SearchBar
-					searchQuery={activeTab === "assembly" ? assemblySearch : deliverSearch}
-					onSearchQueryChange={activeTab === "assembly" ? setAssemblySearch : setDeliverSearch}
-				/>
-				{activeTab === "deliver" && (
-					<div className="search-actions">
-						<CreateShipmentButton
-							onClick={() => setIsShipmentDialogOpen(true)}
-							disabled={assemblyPostings.length === 0}
-						/>
-					</div>
-				)}
-			</section>
-
-			<main className="postings-section">
-				{loadError && (
-					<ErrorMessage
-						message={loadError}
-						onRetry={handleRefresh}
-					/>
-				)}
-
-				{isLoading && <LoadingSpinner />}
-
-				{activeTab === "assembly" && !isLoadingPostings && !postingsLoadError && (
-					<>
-						<div className="postings-summary">
-							Найдено заданий: {filteredAssembly.length}
-							{assemblySearch && ` (из ${assemblyPostings.length})`}
-						</div>
-						<PostingsList postings={filteredAssembly} />
-					</>
-				)}
-
-				{activeTab === "deliver" && !isLoadingDeliver && !deliverLoadError && (
-					<>
-						<div className="postings-summary">
-							Групп отгрузок: {filteredGroups.length}
-							{deliverSearch && ` (найдено по запросу)`}
-						</div>
-						<ShipmentGroupsList groups={filteredGroups} />
-					</>
-				)}
-			</main>
-
-			<CreateShipmentDialog
-				isOpen={isShipmentDialogOpen}
-				onClose={() => setIsShipmentDialogOpen(false)}
-				assemblyPostings={assemblyPostings}
-				onCreateShipment={handleCreateShipment}
-			/>
-		</div>
-	);
+  // 4. User role — assembly page
+  return (
+    <UserPage
+      user={currentUser}
+      onLogout={handleLogout}
+    />
+  );
 }
 
 export default App;

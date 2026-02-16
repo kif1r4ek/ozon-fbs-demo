@@ -4,9 +4,10 @@ export function mapRawFbsPostingToEntity(rawPosting) {
 		status: rawPosting.status,
 		shipmentDate: rawPosting.shipment_date,
 		warehouse: rawPosting.delivery_method?.warehouse || null,
+		labelBarcode: rawPosting.barcodes?.lower_barcode || rawPosting.barcodes?.upper_barcode || null,
 		products: (rawPosting.products || []).map((p) => ({
 			offerId: p.offer_id,
-			productId: p.sku, // SKU OZON - уникальный идентификатор товара в системе OZON
+			productId: p.sku,
 			name: p.name,
 			sku: p.sku,
 			quantity: p.quantity,

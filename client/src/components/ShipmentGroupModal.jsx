@@ -1,12 +1,14 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { formatGroupDate, formatTimeAgo } from "../utils/formatters";
-import { uploadLabelsToS3 } from "../services/assemblyApiService";
+import { uploadLabelsToS3, fetchAssembledPostings, shipGroup } from "../services/assemblyApiService";
+import { fetchAssignedPostings } from "../services/adminApiService";
 import { publishGroup } from "../utils/publishedGroupsStorage";
 import { enrichGroupWithBarcodes } from "../utils/barcodeUtils";
 import { getCompletedPostings, markPostingCompleted } from "../utils/assemblyProgressStorage";
 import { OrderDetailModal } from "./OrderDetailModal";
+import { AssignmentSection } from "./AssignmentSection";
 
-export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
+export function ShipmentGroupModal({ group, onClose, isUserMode = false, isLocked = false }) {
   if (!group) return null;
 
   const [activeTab, setActiveTab] = useState("orders"); // orders, products, settings
@@ -24,6 +26,34 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
   // Состояние для выбранного заказа (для детального просмотра)
   const [selectedPosting, setSelectedPosting] = useState(null);
 
+  // Состояние для отгрузки в Ozon
+  const [assembledCount, setAssembledCount] = useState(0);
+  const [assembledPostingNumbers, setAssembledPostingNumbers] = useState([]);
+  const [isLoadingAssembled, setIsLoadingAssembled] = useState(false);
+  const [isShipping, setIsShipping] = useState(false);
+  const [shipResult, setShipResult] = useState(null);
+  const [shipError, setShipError] = useState(null);
+
+  // Загружаем данные о собранных заказах для админа
+  useEffect(() => {
+    if (isUserMode || !group.shipmentDate) return;
+
+    const loadAssembled = async () => {
+      setIsLoadingAssembled(true);
+      try {
+        const data = await fetchAssembledPostings(group.shipmentDate);
+        setAssembledCount(data.count);
+        setAssembledPostingNumbers(data.postingNumbers);
+      } catch (err) {
+        console.error("Ошибка загрузки собранных заказов:", err);
+      } finally {
+        setIsLoadingAssembled(false);
+      }
+    };
+
+    loadAssembled();
+  }, [group.shipmentDate, isUserMode]);
+
   // Обогащаем группу баркодами
   const enrichedGroup = useMemo(() => enrichGroupWithBarcodes(group), [group]);
 
@@ -37,26 +67,35 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
     setLabelsReady(false);
 
     try {
-      console.log("🔍 Начинаем загрузку этикеток");
-      console.log("📦 Всего заказов в группе:", group.postings.length);
-      console.log("📅 Дата группы:", group.shipmentDate);
-
-      // Проверяем структуру первого заказа
-      if (group.postings.length > 0) {
-        console.log("📋 Пример заказа:", {
-          postingNumber: group.postings[0].postingNumber,
-          shipmentNumber: group.postings[0].shipmentNumber,
-          shipmentDate: group.postings[0].shipmentDate,
-          products: group.postings[0].products?.length
-        });
+      // Получаем список назначенных пользователям postingNumbers
+      let assignedSet = null;
+      try {
+        const { postingNumbers } = await fetchAssignedPostings(group.shipmentDate);
+        if (postingNumbers && postingNumbers.length > 0) {
+          assignedSet = new Set(postingNumbers);
+        }
+      } catch {
+        // Если не удалось получить назначения, пропускаем фильтрацию
       }
 
+      // Фильтруем: загружаем этикетки только для назначенных заказов
+      const postingsToLoad = assignedSet
+        ? group.postings.filter((p) => assignedSet.has(p.postingNumber))
+        : group.postings;
+
+      if (postingsToLoad.length === 0) {
+        setLabelsError("Нет назначенных заказов. Сначала назначьте заказы сотрудникам.");
+        setIsLoadingLabels(false);
+        return;
+      }
+
+      console.log(`Загрузка этикеток: ${postingsToLoad.length} из ${group.postings.length} (назначенных)`);
+
       // Группируем отправления по shipmentNumber
-      // Если shipmentNumber нет, используем дату группы как идентификатор
       const groupedByShipment = {};
       let skippedCount = 0;
 
-      group.postings.forEach((posting) => {
+      postingsToLoad.forEach((posting) => {
         const shipmentNumber = posting.shipmentNumber || `TEMP-${group.shipmentDate}`;
         const shipmentDate = posting.shipmentDate || group.shipmentDate;
 
@@ -75,31 +114,25 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
         groupedByShipment[shipmentNumber].postingNumbers.push(posting.postingNumber);
       });
 
-      console.log("📊 Пропущено заказов:", skippedCount);
-      console.log("📦 Групп отгрузок:", Object.keys(groupedByShipment).length);
-      console.log("📋 Детали групп:", groupedByShipment);
+      if (skippedCount > 0) {
+        console.log("Пропущено заказов без даты:", skippedCount);
+      }
 
       // Загружаем этикетки в S3 для каждой поставки
       const allLabels = [];
       let totalProcessed = 0;
+      const totalToLoad = postingsToLoad.length;
 
-      setUploadProgress({ current: 0, total: totalPostings });
+      setUploadProgress({ current: 0, total: totalToLoad });
 
       for (const [shipmentNumber, data] of Object.entries(groupedByShipment)) {
-        console.log(`📤 Загружаем группу ${shipmentNumber}:`, {
-          date: data.shipmentDate,
-          postings: data.postingNumbers.length
-        });
-
         const shipmentLabels = await uploadLabelsToS3(
           data.shipmentDate,
           shipmentNumber,
           data.postingNumbers,
           (progressData) => {
-            console.log("📈 Прогресс:", progressData);
-            // Обновляем прогресс
             totalProcessed++;
-            setUploadProgress({ current: totalProcessed, total: totalPostings });
+            setUploadProgress({ current: totalProcessed, total: totalToLoad });
 
             // Добавляем URL этикетки в список
             if (progressData.success && progressData.labelUrl) {
@@ -108,17 +141,11 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
           }
         );
 
-        console.log(`✅ Группа ${shipmentNumber} загружена:`, shipmentLabels.length, "этикеток");
         allLabels.push(...shipmentLabels);
       }
 
-      console.log("🎉 Загрузка завершена! Всего этикеток:", allLabels.length);
-
       const successfulLabels = allLabels.filter(l => l.success);
       const failedLabels = allLabels.filter(l => !l.success);
-
-      console.log("✅ Успешно загружено:", successfulLabels.length);
-      console.log("❌ Ошибок загрузки:", failedLabels.length);
 
       if (failedLabels.length > 0) {
         console.error("Ошибки загрузки:", failedLabels);
@@ -133,12 +160,51 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
         setLabelsReady(false);
       }
     } catch (err) {
-      console.error("❌ Критическая ошибка при загрузке этикеток:", err);
-      console.error("Стек ошибки:", err.stack);
+      console.error("Ошибка при загрузке этикеток:", err);
       setLabelsError(err.message || "Неизвестная ошибка при загрузке этикеток");
     } finally {
       setIsLoadingLabels(false);
       setUploadProgress({ current: 0, total: 0 });
+    }
+  };
+
+  const handleShipToOzon = async () => {
+    if (assembledPostingNumbers.length === 0) return;
+
+    setIsShipping(true);
+    setShipError(null);
+    setShipResult(null);
+
+    try {
+      const result = await shipGroup(assembledPostingNumbers);
+      setShipResult(result);
+
+      // Обнуляем собранные, так как они отгружены
+      if (result.shipped && result.shipped.length > 0) {
+        const remaining = assembledPostingNumbers.filter(
+          (pn) => !result.shipped.includes(pn)
+        );
+        setAssembledPostingNumbers(remaining);
+        setAssembledCount(remaining.length);
+      }
+    } catch (err) {
+      console.error("Ошибка отгрузки:", err);
+      setShipError(err.message || "Ошибка при отгрузке в Ozon");
+    } finally {
+      setIsShipping(false);
+    }
+  };
+
+  const handleRefreshAssembled = async () => {
+    setIsLoadingAssembled(true);
+    try {
+      const data = await fetchAssembledPostings(group.shipmentDate);
+      setAssembledCount(data.count);
+      setAssembledPostingNumbers(data.postingNumbers);
+    } catch (err) {
+      console.error("Ошибка обновления:", err);
+    } finally {
+      setIsLoadingAssembled(false);
     }
   };
 
@@ -257,7 +323,10 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
       <div className="modal shipment-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div className="modal-title-section">
-            <div className="modal-title">{groupName}</div>
+            <div className="modal-title">
+              {groupName}
+              {isLocked && <span className="status-badge status-badge--in-progress">В работе</span>}
+            </div>
             <div className="modal-subtitle">Заказы в поставке</div>
           </div>
           <button className="close-button" onClick={onClose} type="button">
@@ -342,83 +411,169 @@ export function ShipmentGroupModal({ group, onClose, isUserMode = false }) {
 
           {activeTab === "settings" && !isUserMode && (
             <div className="settings-tab-content">
-              <div className="settings-section">
-                <div className="settings-section-header">
-                  <h3 className="settings-section-title">ЭТИКЕТКИ</h3>
+              {isLocked && (
+                <div className="locked-banner">
+                  <div className="locked-banner-icon">&#128274;</div>
+                  <div className="locked-banner-text">
+                    <div className="locked-banner-title">Группа в работе</div>
+                    <div className="locked-banner-desc">Заказы переданы сотрудникам. Изменения заблокированы.</div>
+                  </div>
                 </div>
+              )}
 
-                <div className="settings-section-content">
-                  {isLoadingLabels && uploadProgress.total > 0 && (
-                    <div className="labels-progress">
-                      <div className="labels-progress-header">
-                        <span className="labels-progress-title">Загрузка этикеток в S3</span>
-                        <span className="labels-progress-percent">
-                          {Math.round((uploadProgress.current / uploadProgress.total) * 100)}%
-                        </span>
-                      </div>
-                      <div className="labels-progress-bar-container">
-                        <div
-                          className="labels-progress-bar"
-                          style={{
-                            width: `${(uploadProgress.current / uploadProgress.total) * 100}%`
-                          }}
-                        />
-                      </div>
-                      <div className="labels-progress-text">
-                        Загружено: {uploadProgress.current} / {uploadProgress.total}
-                      </div>
-                    </div>
-                  )}
+              <div className={isLocked ? "settings-locked" : ""}>
+                <div className="settings-section">
+                  <div className="settings-section-header">
+                    <h3 className="settings-section-title">ЭТИКЕТКИ</h3>
+                  </div>
 
-                  {labelsReady && !isLoadingLabels && (
-                    <div className="labels-status">
-                      <div className="labels-status-icon">✓</div>
-                      <div className="labels-status-content">
-                        <div className="labels-status-text">Этикетки готовы</div>
-                        <div className="labels-status-details">
-                          Загружено в S3: {labelUrls.length} {labelUrls.length === 1 ? 'файл' : labelUrls.length < 5 ? 'файла' : 'файлов'}
+                  <div className="settings-section-content">
+                    {isLoadingLabels && uploadProgress.total > 0 && (
+                      <div className="labels-progress">
+                        <div className="labels-progress-header">
+                          <span className="labels-progress-title">Загрузка этикеток в S3</span>
+                          <span className="labels-progress-percent">
+                            {Math.round((uploadProgress.current / uploadProgress.total) * 100)}%
+                          </span>
+                        </div>
+                        <div className="labels-progress-bar-container">
+                          <div
+                            className="labels-progress-bar"
+                            style={{
+                              width: `${(uploadProgress.current / uploadProgress.total) * 100}%`
+                            }}
+                          />
+                        </div>
+                        <div className="labels-progress-text">
+                          Загружено: {uploadProgress.current} / {uploadProgress.total}
                         </div>
                       </div>
-                    </div>
-                  )}
-
-                  {labelsError && (
-                    <div className="labels-error">
-                      <div className="labels-error-icon">⚠</div>
-                      <div className="labels-error-text">{labelsError}</div>
-                    </div>
-                  )}
-
-                  {!labelsReady && !isLoadingLabels && (
-                    <div className="labels-info">
-                      <div className="labels-info-text">
-                        Будет загружено этикеток: {totalPostings}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="settings-actions">
-                    {!labelsReady && (
-                      <button
-                        className="settings-button-primary"
-                        onClick={handleLoadLabels}
-                        disabled={isLoadingLabels || totalPostings === 0}
-                        type="button"
-                      >
-                        {isLoadingLabels ? "Загружаем..." : "Загрузить этикетки"}
-                      </button>
                     )}
 
                     {labelsReady && !isLoadingLabels && (
+                      <div className="labels-status">
+                        <div className="labels-status-icon">✓</div>
+                        <div className="labels-status-content">
+                          <div className="labels-status-text">Этикетки готовы</div>
+                          <div className="labels-status-details">
+                            Загружено в S3: {labelUrls.length} {labelUrls.length === 1 ? 'файл' : labelUrls.length < 5 ? 'файла' : 'файлов'}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {labelsError && (
+                      <div className="labels-error">
+                        <div className="labels-error-icon">⚠</div>
+                        <div className="labels-error-text">{labelsError}</div>
+                      </div>
+                    )}
+
+                    {!labelsReady && !isLoadingLabels && (
+                      <div className="labels-info">
+                        <div className="labels-info-text">
+                          Будет загружено этикеток для назначенных заказов
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="settings-actions">
+                      {!labelsReady && (
+                        <button
+                          className="settings-button-primary"
+                          onClick={handleLoadLabels}
+                          disabled={isLocked || isLoadingLabels || totalPostings === 0}
+                          type="button"
+                        >
+                          {isLoadingLabels ? "Загружаем..." : "Загрузить этикетки"}
+                        </button>
+                      )}
+
+                      {labelsReady && !isLoadingLabels && (
+                        <button
+                          className="settings-button-success"
+                          onClick={handleDownloadLabels}
+                          disabled={isLocked || labelUrls.length === 0}
+                          type="button"
+                        >
+                          Получить этикетки
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <AssignmentSection
+                  shipmentDate={group.shipmentDate}
+                  totalOrders={totalPostings}
+                  isLocked={isLocked}
+                />
+
+                <div className="settings-section">
+                  <div className="settings-section-header">
+                    <h3 className="settings-section-title">ОТГРУЗКА В OZON</h3>
+                    <button
+                      className="settings-refresh-button"
+                      onClick={handleRefreshAssembled}
+                      disabled={isLoadingAssembled}
+                      type="button"
+                      title="Обновить данные"
+                    >
+                      {isLoadingAssembled ? "..." : "↻"}
+                    </button>
+                  </div>
+
+                  <div className="settings-section-content">
+                    <div className="ship-status-info">
+                      <div className="ship-status-row">
+                        <span className="ship-status-label">Собрано заказов:</span>
+                        <span className="ship-status-value">
+                          {assembledCount} / {totalPostings}
+                        </span>
+                      </div>
+                    </div>
+
+                    {shipResult && (
+                      <div className="ship-result">
+                        {shipResult.shipped && shipResult.shipped.length > 0 && (
+                          <div className="ship-result-success">
+                            Отгружено: {shipResult.shipped.length}
+                          </div>
+                        )}
+                        {shipResult.failed && shipResult.failed.length > 0 && (
+                          <div className="ship-result-errors">
+                            <div className="ship-result-error-title">
+                              Ошибки: {shipResult.failed.length}
+                            </div>
+                            {shipResult.failed.map((f) => (
+                              <div className="ship-result-error-item" key={f.postingNumber}>
+                                {f.postingNumber}: {f.error}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {shipError && (
+                      <div className="labels-error">
+                        <div className="labels-error-icon">!</div>
+                        <div className="labels-error-text">{shipError}</div>
+                      </div>
+                    )}
+
+                    <div className="settings-actions">
                       <button
-                        className="settings-button-success"
-                        onClick={handleDownloadLabels}
-                        disabled={labelUrls.length === 0}
+                        className="settings-button-primary"
+                        onClick={handleShipToOzon}
+                        disabled={isShipping || assembledCount === 0}
                         type="button"
                       >
-                        Получить этикетки
+                        {isShipping
+                          ? "Отгружаем..."
+                          : `Отгрузить в Ozon (${assembledCount})`}
                       </button>
-                    )}
+                    </div>
                   </div>
                 </div>
               </div>

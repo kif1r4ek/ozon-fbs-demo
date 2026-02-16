@@ -1,0 +1,120 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  super_admin
+  admin
+  user
+}
+
+enum DeliveryStatus {
+  awaiting_packaging
+  awaiting_deliver
+  delivering
+  delivered
+  cancelled
+}
+
+enum AuditAction {
+  USER_CREATED
+  USER_UPDATED
+  USER_DELETED
+  USER_LOGIN
+  USER_LOGOUT
+  DELIVERY_CREATED
+  DELIVERY_UPDATED
+  DELIVERY_ASSIGNED
+  SYNC_TRIGGERED
+  SETTINGS_CHANGED
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  login        String   @unique @db.VarChar(100)
+  name         String   @db.VarChar(200)
+  role         Role     @default(user)
+  passwordHash String   @map("password_hash") @db.VarChar(128)
+  passwordSalt String   @map("password_salt") @db.VarChar(32)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  deliveriesAssigned Delivery[]
+  auditLogs          AuditLog[] @relation("AuditUser")
+  auditLogsTarget    AuditLog[] @relation("AuditTarget")
+
+  @@map("users")
+}
+
+model Delivery {
+  id             Int            @id @default(autoincrement())
+  postingNumber  String         @unique @map("posting_number") @db.VarChar(50)
+  status         DeliveryStatus @default(awaiting_packaging)
+  shipmentDate   DateTime?      @map("shipment_date")
+  shipmentNumber String?        @map("shipment_number") @db.VarChar(50)
+  labelBarcode   String?        @map("label_barcode") @db.VarChar(50)
+  warehouse      String?        @db.VarChar(200)
+  assembledAt    DateTime?      @map("assembled_at")
+  assignedUserId Int?           @map("assigned_user_id")
+  assignedUser   User?          @relation(fields: [assignedUserId], references: [id], onDelete: SetNull)
+  ozonCreatedAt  DateTime?      @map("ozon_created_at")
+  syncedAt       DateTime       @default(now()) @map("synced_at")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  products Product[]
+
+  @@index([status])
+  @@index([shipmentDate])
+  @@index([assignedUserId])
+  @@map("deliveries")
+}
+
+model Product {
+  id         Int      @id @default(autoincrement())
+  deliveryId Int      @map("delivery_id")
+  delivery   Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  offerId    String   @map("offer_id") @db.VarChar(100)
+  sku        String   @db.VarChar(50)
+  name       String   @db.VarChar(500)
+  quantity   Int
+  price      String?  @db.VarChar(20)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([deliveryId])
+  @@index([offerId])
+  @@map("products")
+}
+
+model AuditLog {
+  id         Int         @id @default(autoincrement())
+  userId     Int?        @map("user_id")
+  user       User?       @relation("AuditUser", fields: [userId], references: [id], onDelete: Cascade)
+  action     AuditAction
+  targetType String?     @map("target_type") @db.VarChar(50)
+  targetId   Int?        @map("target_id")
+  targetUser User?       @relation("AuditTarget", fields: [targetId], references: [id], onDelete: SetNull)
+  details    Json?
+  ipAddress  String?     @map("ip_address") @db.VarChar(45)
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+model SyncState {
+  id         Int      @id @default(autoincrement())
+  lastSyncAt DateTime @map("last_sync_at")
+  status     String   @default("idle") @db.VarChar(20)
+  error      String?  @db.Text
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("sync_state")
+}

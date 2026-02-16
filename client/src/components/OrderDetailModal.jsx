@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import { findProductByBarcode, verifyLabelBarcode } from "../services/moySkladService";
-import { fetchLabelUrl } from "../services/assemblyApiService";
+import { findProductByBarcode } from "../services/moySkladService";
+import { fetchLabelUrl, fetchLabelBarcode, markPostingAssembled } from "../services/assemblyApiService";
 import "./OrderDetailModal.css";
 
 /**
@@ -182,9 +182,12 @@ export function OrderDetailModal({ posting, onClose, onNext, onComplete, hasNext
     }
   };
 
+  // Кешируем ожидаемый баркод этикетки
+  const [expectedLabelBarcode, setExpectedLabelBarcode] = useState(posting.labelBarcode || null);
+
   /**
    * Обработка отсканированного штрихкода этикетки
-   * Проверяет через МойСклад (ШКНИЗ, ШКВЕРХ и все доступные поля) + postingNumber
+   * Сверяем с баркодом из OZON API (barcodes.lower_barcode)
    */
   const handleLabelScanSubmit = async (barcode) => {
     setLabelScanError("");
@@ -192,29 +195,44 @@ export function OrderDetailModal({ posting, onClose, onNext, onComplete, hasNext
     setIsVerifyingLabel(true);
 
     try {
-      // Собираем все артикулы из заказа для проверки
-      const articles = posting.products.map((p) => p.offerId);
+      const normalizedBarcode = barcode.trim().replace(/\s+/g, "");
 
-      const verification = await verifyLabelBarcode(barcode, articles, posting.postingNumber);
-
-      if (!verification.valid) {
-        setLabelScanError(verification.error || 'Этикетка не прошла проверку');
-        setLabelScanValue("");
-        setIsVerifyingLabel(false);
-        return;
+      // Если баркод ещё не загружен — запрашиваем у сервера
+      let expected = expectedLabelBarcode;
+      if (!expected) {
+        try {
+          expected = await fetchLabelBarcode(posting.postingNumber);
+          setExpectedLabelBarcode(expected);
+        } catch {
+          setLabelScanError("Не удалось получить баркод этикетки. Отсканируйте повторно.");
+          setLabelScanValue("");
+          setIsVerifyingLabel(false);
+          return;
+        }
       }
 
-      setLabelScanSuccess('Этикетка отсканирована успешно!');
-      setLabelScanPassed(true);
-      setLabelScanValue("");
+      const normalizedExpected = expected.trim().replace(/\s+/g, "");
 
-      // Вызываем onComplete для пометки заказа как обработанного
-      if (onComplete) {
-        onComplete(posting);
+      if (normalizedBarcode === normalizedExpected) {
+        setLabelScanSuccess("Этикетка подтверждена!");
+        setLabelScanPassed(true);
+        setLabelScanValue("");
+
+        // Отмечаем заказ как собранный в БД
+        markPostingAssembled(posting.postingNumber).catch((err) => {
+          console.error("Ошибка отметки сборки в БД:", err);
+        });
+
+        if (onComplete) {
+          onComplete(posting);
+        }
+      } else {
+        setLabelScanError("Отсканируйте повторно");
+        setLabelScanValue("");
       }
     } catch (error) {
-      console.error('Ошибка проверки этикетки:', error);
-      setLabelScanError('Ошибка проверки этикетки');
+      console.error("Ошибка проверки этикетки:", error);
+      setLabelScanError("Отсканируйте повторно");
       setLabelScanValue("");
     } finally {
       setIsVerifyingLabel(false);
@@ -349,13 +367,16 @@ export function OrderDetailModal({ posting, onClose, onNext, onComplete, hasNext
             </div>
           )}
 
+          {/* Статус безошибочной сборки */}
+          {isAllScanned && (
+            <div className="scan-status-row success">
+              Безошибочная сборка пройдена
+            </div>
+          )}
+
           {/* Этап 1: Все товары отсканированы — кнопка "Открыть этикетку" */}
           {isAllScanned && !labelOpened && !labelScanPassed && (
             <div className="scan-section label-scan-section">
-              <div className="scan-complete-notice">
-                <div className="scan-complete-text">Все товары отсканированы!</div>
-                <div className="scan-complete-subtitle">Откройте этикетку для наклейки на заказ</div>
-              </div>
               <button
                 className="open-label-button"
                 onClick={handleOpenLabel}
@@ -388,16 +409,22 @@ export function OrderDetailModal({ posting, onClose, onNext, onComplete, hasNext
                   disabled={isVerifyingLabel}
                 />
               </div>
-              {isVerifyingLabel && <div className="scan-message info">Проверка этикетки через МойСклад...</div>}
+              {isVerifyingLabel && <div className="scan-message info">Проверка этикетки...</div>}
               {labelScanError && <div className="scan-message error">{labelScanError}</div>}
               {labelScanSuccess && <div className="scan-message success">{labelScanSuccess}</div>}
+            </div>
+          )}
+
+          {/* Статус этикетки */}
+          {isAllScanned && labelScanPassed && (
+            <div className="scan-status-row success">
+              Этикетка подтверждена
             </div>
           )}
 
           {/* Финальное сообщение о завершении + кнопка "Далее" */}
           {isAllScanned && labelScanPassed && (
             <div className="scan-complete-message">
-              <div className="scan-complete-icon">&#10004;</div>
               <div className="scan-complete-text">Заказ полностью обработан!</div>
               <button
                 className="next-order-button"

@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, PutObjectCommand, ListBucketsCommand, HeadBucketCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, ListBucketsCommand, HeadBucketCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 // Пробуем разные конфигурации для TWC Storage
@@ -72,17 +72,19 @@ export async function getLabelUrl(shipmentDate, shipmentNumber, postingNumber) {
 	// Структура: "Отгрузка от DD-MM-YYYY/OZON-XXXXXXXX/posting.pdf"
 	const key = `Отгрузка от ${folderName}/${shipmentNumber}/${postingNumber}.pdf`;
 
-	const command = new GetObjectCommand({
-		Bucket: bucket,
-		Key: key,
-	});
-
 	try {
+		// Проверяем, что файл существует в S3
+		await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+
 		// Генерируем URL с временем жизни 1 час
+		const command = new GetObjectCommand({ Bucket: bucket, Key: key });
 		const url = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
 		return url;
 	} catch (error) {
-		console.error(`Ошибка при генерации URL для ${key}:`, error);
+		console.error(`Ошибка при получении этикетки (key: ${key}):`, error.code || error.name);
+		if (error.name === "NotFound" || error.$metadata?.httpStatusCode === 404) {
+			throw new Error(`Этикетка не найдена в S3. Ключ: ${key}`);
+		}
 		throw new Error(`Не удалось получить URL этикетки: ${error.message}`);
 	}
 }

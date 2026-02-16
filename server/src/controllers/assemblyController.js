@@ -1,10 +1,13 @@
 import { getAllAssemblyPostings } from "../useCases/fetchAssemblyPostings.js";
 import { getAllAssemblyProducts } from "../useCases/fetchAssemblyProducts.js";
 import { getAllAwaitingDeliverPostings } from "../useCases/fetchAwaitingDeliverPostings.js";
-import { fetchPackageLabel } from "../infrastructure/ozonApiClient.js";
+import { shipGroupToOzon } from "../useCases/shipPostings.js";
+import { fetchPackageLabel, fetchFbsPostingDetails } from "../infrastructure/ozonApiClient.js";
 import { generatePostingsXlsx } from "../useCases/generatePostingsXlsx.js";
 import { getLabelUrl, getLabelUrls, uploadLabelToS3, createFolderInS3, testS3Connection } from "../infrastructure/s3Client.js";
 import { verifyBarcodeForArticle, findArticleByBarcode, verifyLabelBarcode } from "../infrastructure/moySkladApiClient.js";
+import { writeAuditLog } from "../useCases/writeAuditLog.js";
+import prisma from "../infrastructure/prismaClient.js";
 
 export async function handleGetAssemblyPostings(_request, response) {
 	try {
@@ -205,6 +208,19 @@ export async function handleUploadLabelsToS3(request, response) {
 			}
 		}
 
+		// Сохраняем shipmentNumber в БД для успешно загруженных этикеток
+		const successPostings = results.filter((r) => r.success).map((r) => r.postingNumber);
+		if (successPostings.length > 0) {
+			try {
+				await prisma.delivery.updateMany({
+					where: { postingNumber: { in: successPostings } },
+					data: { shipmentNumber },
+				});
+			} catch (dbError) {
+				console.error("Ошибка сохранения shipmentNumber в БД:", dbError.message);
+			}
+		}
+
 		// Отправляем финальный результат
 		response.write(`data: ${JSON.stringify({
 			type: "complete",
@@ -352,11 +368,29 @@ export async function handleFindProductByBarcode(request, response) {
  */
 export async function handleGetLabelUrl(request, response) {
 	try {
-		const { shipmentDate, shipmentNumber, postingNumber } = request.body;
+		const { shipmentDate, postingNumber } = request.body;
+		let { shipmentNumber } = request.body;
 
-		if (!shipmentDate || !shipmentNumber || !postingNumber) {
+		if (!shipmentDate || !postingNumber) {
 			return response.status(400).json({
-				error: "Необходимо передать shipmentDate, shipmentNumber и postingNumber",
+				error: "Необходимо передать shipmentDate и postingNumber",
+			});
+		}
+
+		// Если shipmentNumber не передан или это fallback — ищем в БД
+		if (!shipmentNumber || shipmentNumber.startsWith("TEMP-")) {
+			const delivery = await prisma.delivery.findUnique({
+				where: { postingNumber },
+				select: { shipmentNumber: true },
+			});
+			if (delivery?.shipmentNumber) {
+				shipmentNumber = delivery.shipmentNumber;
+			}
+		}
+
+		if (!shipmentNumber) {
+			return response.status(400).json({
+				error: "Не удалось определить shipmentNumber. Этикетка, возможно, ещё не загружена.",
 			});
 		}
 
@@ -394,5 +428,163 @@ export async function handleVerifyLabelBarcode(request, response) {
 			valid: false,
 			error: "Ошибка проверки этикетки: " + error.message,
 		});
+	}
+}
+
+/**
+ * Получение баркода этикетки для отправления
+ * POST /api/assembly/label-barcode
+ * Body: { postingNumber: "66723793-0952-1" }
+ *
+ * Сначала ищет в БД, если нет — запрашивает у OZON API и сохраняет в БД
+ */
+export async function handleGetLabelBarcode(request, response) {
+	try {
+		const { postingNumber } = request.body;
+
+		if (!postingNumber) {
+			return response.status(400).json({
+				error: "Необходимо передать postingNumber",
+			});
+		}
+
+		// Ищем в БД
+		const delivery = await prisma.delivery.findUnique({
+			where: { postingNumber },
+			select: { labelBarcode: true },
+		});
+
+		if (delivery?.labelBarcode) {
+			return response.json({ barcode: delivery.labelBarcode });
+		}
+
+		// Не найден в БД — запрашиваем у OZON API
+		const details = await fetchFbsPostingDetails(postingNumber);
+		const barcode = details?.result?.barcodes?.lower_barcode
+			|| details?.result?.barcodes?.upper_barcode
+			|| null;
+
+		// Сохраняем в БД для следующих запросов
+		if (barcode && delivery) {
+			await prisma.delivery.update({
+				where: { postingNumber },
+				data: { labelBarcode: barcode },
+			}).catch(() => {});
+		}
+
+		if (!barcode) {
+			return response.status(404).json({
+				error: "Баркод этикетки не найден в OZON API",
+			});
+		}
+
+		response.json({ barcode });
+	} catch (error) {
+		console.error("Ошибка получения баркода этикетки:", error.message);
+		response.status(500).json({
+			error: "Не удалось получить баркод: " + error.message,
+		});
+	}
+}
+
+/**
+ * Пометить заказ как собранный (после сканирования всех товаров + этикетки)
+ * POST /api/assembly/mark-assembled
+ * Body: { postingNumber: "66723793-0952-1" }
+ */
+export async function handleMarkAssembled(request, response) {
+	try {
+		const { postingNumber } = request.body;
+
+		if (!postingNumber) {
+			return response.status(400).json({ error: "Необходимо передать postingNumber" });
+		}
+
+		const delivery = await prisma.delivery.findUnique({
+			where: { postingNumber },
+		});
+
+		if (!delivery) {
+			return response.status(404).json({ error: "Отправление не найдено в БД" });
+		}
+
+		await prisma.delivery.update({
+			where: { postingNumber },
+			data: { assembledAt: new Date() },
+		});
+
+		response.json({ success: true, postingNumber });
+	} catch (error) {
+		console.error("Ошибка отметки сборки:", error.message);
+		response.status(500).json({ error: "Не удалось отметить сборку: " + error.message });
+	}
+}
+
+/**
+ * Пакетная отгрузка группы заказов в Ozon
+ * POST /api/assembly/ship-group
+ * Body: { postingNumbers: ["66723793-0952-1", "66723793-0953-1"] }
+ */
+export async function handleShipGroup(request, response) {
+	try {
+		const { postingNumbers } = request.body;
+
+		if (!Array.isArray(postingNumbers) || postingNumbers.length === 0) {
+			return response.status(400).json({ error: "Необходимо передать массив postingNumbers" });
+		}
+
+		const result = await shipGroupToOzon(postingNumbers);
+
+		writeAuditLog({
+			userId: request.user?.id,
+			action: "DELIVERY_UPDATED",
+			targetType: "delivery_group",
+			details: {
+				action: "ship_to_ozon",
+				shipped: result.shipped,
+				failed: result.failed,
+				total: postingNumbers.length,
+			},
+			ipAddress: request.ip,
+		}).catch(() => {});
+
+		response.json(result);
+	} catch (error) {
+		console.error("Ошибка пакетной отгрузки:", error.message);
+		response.status(500).json({ error: "Ошибка отгрузки: " + error.message });
+	}
+}
+
+/**
+ * Получить список собранных заказов для даты отгрузки
+ * GET /api/assembly/assembled?shipmentDate=2026-02-15T16:00:00.000Z
+ */
+export async function handleGetAssembledPostings(request, response) {
+	try {
+		const { shipmentDate } = request.query;
+
+		if (!shipmentDate) {
+			return response.status(400).json({ error: "Необходимо передать shipmentDate" });
+		}
+
+		const deliveries = await prisma.delivery.findMany({
+			where: {
+				shipmentDate: new Date(shipmentDate),
+				assembledAt: { not: null },
+				status: "awaiting_packaging",
+			},
+			select: {
+				postingNumber: true,
+				assembledAt: true,
+			},
+		});
+
+		response.json({
+			postingNumbers: deliveries.map((d) => d.postingNumber),
+			count: deliveries.length,
+		});
+	} catch (error) {
+		console.error("Ошибка получения собранных заказов:", error.message);
+		response.status(500).json({ error: "Ошибка: " + error.message });
 	}
 }

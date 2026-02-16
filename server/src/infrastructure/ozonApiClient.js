@@ -150,6 +150,34 @@ export async function fetchFbsPostingsByStatus(status, offset = 0, limit = 1000)
 }
 
 
+/**
+ * Получить детали одного отправления (включая barcodes)
+ * POST /v3/posting/fbs/get
+ */
+export async function fetchFbsPostingDetails(postingNumber) {
+	const requestBody = {
+		posting_number: postingNumber,
+		with: {
+			barcodes: true,
+		},
+	};
+
+	return sendPostRequest("/v3/posting/fbs/get", requestBody);
+}
+
+/**
+ * Отгрузить FBS отправление в Ozon
+ * POST /v4/posting/fbs/ship
+ */
+export async function shipFbsPosting(postingNumber, packages) {
+	return sendPostRequest("/v4/posting/fbs/ship", {
+		posting_number: postingNumber,
+		packages,
+		with: { additional_data: true },
+	});
+}
+
+
 export async function fetchPackageLabel(postingNumbers) {
 	const requestBody = {
 		posting_number: postingNumbers,

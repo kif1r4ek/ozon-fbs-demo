@@ -1,4 +1,4 @@
-const API_BASE_URL = "http://localhost:5000/api/assembly";
+const API_BASE_URL = "/api/assembly";
 
 export async function fetchAssemblyPostings() {
 	const response = await fetch(`${API_BASE_URL}/postings`);
@@ -120,6 +120,77 @@ export async function createFolderInS3(shipmentDate, shipmentNumber) {
  * @param {Function} onProgress - Callback для обновления прогресса
  * @returns {Promise<Array>} - Массив результатов загрузки
  */
+/**
+ * Получение баркода этикетки для отправления (из БД или OZON API)
+ * @param {string} postingNumber - Номер отправления
+ * @returns {Promise<string>} - Баркод этикетки
+ */
+export async function fetchLabelBarcode(postingNumber) {
+	const response = await fetch(`${API_BASE_URL}/label-barcode`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ postingNumber }),
+	});
+	if (!response.ok) {
+		const errorData = await response.json().catch(() => null);
+		throw new Error(
+			errorData?.error || `Ошибка получения баркода: ${response.status}`
+		);
+	}
+	const data = await response.json();
+	return data.barcode;
+}
+
+/**
+ * Пометить заказ как собранный (после сканирования всех товаров + этикетки)
+ * @param {string} postingNumber - Номер отправления
+ * @returns {Promise<{success: boolean}>}
+ */
+export async function markPostingAssembled(postingNumber) {
+	const response = await fetch(`${API_BASE_URL}/mark-assembled`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ postingNumber }),
+	});
+	if (!response.ok) {
+		const errorData = await response.json().catch(() => null);
+		throw new Error(errorData?.error || `Ошибка отметки сборки: ${response.status}`);
+	}
+	return response.json();
+}
+
+/**
+ * Пакетная отгрузка группы заказов в Ozon
+ * @param {string[]} postingNumbers - Массив номеров отправлений
+ * @returns {Promise<{shipped: string[], failed: Array}>}
+ */
+export async function shipGroup(postingNumbers) {
+	const response = await fetch(`${API_BASE_URL}/ship-group`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ postingNumbers }),
+	});
+	if (!response.ok) {
+		const errorData = await response.json().catch(() => null);
+		throw new Error(errorData?.error || `Ошибка отгрузки: ${response.status}`);
+	}
+	return response.json();
+}
+
+/**
+ * Получить список собранных заказов для даты отгрузки
+ * @param {string} shipmentDate - Дата отгрузки (ISO string)
+ * @returns {Promise<{postingNumbers: string[], count: number}>}
+ */
+export async function fetchAssembledPostings(shipmentDate) {
+	const response = await fetch(`${API_BASE_URL}/assembled?shipmentDate=${encodeURIComponent(shipmentDate)}`);
+	if (!response.ok) {
+		const errorData = await response.json().catch(() => null);
+		throw new Error(errorData?.error || `Ошибка: ${response.status}`);
+	}
+	return response.json();
+}
+
 export async function uploadLabelsToS3(shipmentDate, shipmentNumber, postingNumbers, onProgress) {
 	return new Promise((resolve, reject) => {
 		fetch(`${API_BASE_URL}/upload-labels`, {

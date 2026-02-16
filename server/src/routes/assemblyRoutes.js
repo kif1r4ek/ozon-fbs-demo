@@ -12,7 +12,12 @@ import {
 	handleFindProductByBarcode,
 	handleGetLabelUrl,
 	handleVerifyLabelBarcode,
+	handleGetLabelBarcode,
+	handleMarkAssembled,
+	handleShipGroup,
+	handleGetAssembledPostings,
 } from "../controllers/assemblyController.js";
+import { authenticate, authorize } from "../middleware/authMiddleware.js";
 
 const assemblyRouter = Router();
 
@@ -28,5 +33,15 @@ assemblyRouter.post("/verify-barcode", handleVerifyBarcode);
 assemblyRouter.post("/find-product-by-barcode", handleFindProductByBarcode);
 assemblyRouter.post("/label-url", handleGetLabelUrl);
 assemblyRouter.post("/verify-label-barcode", handleVerifyLabelBarcode);
+assemblyRouter.post("/label-barcode", handleGetLabelBarcode);
+
+// Отметка сборки — доступно любому авторизованному пользователю
+assemblyRouter.post("/mark-assembled", authenticate, handleMarkAssembled);
+
+// Получение собранных заказов — доступно админам
+assemblyRouter.get("/assembled", authenticate, authorize("super_admin", "admin"), handleGetAssembledPostings);
+
+// Пакетная отгрузка — только админы
+assemblyRouter.post("/ship-group", authenticate, authorize("super_admin", "admin"), handleShipGroup);
 
 export default assemblyRouter;
