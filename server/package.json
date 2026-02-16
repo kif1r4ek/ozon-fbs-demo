@@ -1,0 +1,26 @@
+{
+  "name": "ozon-fbs-assembly-server",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": [
+    "ozon",
+    "fbs",
+    "assembly"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "Backend proxy for OZON FBS assembly API",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.987.0",
+    "@aws-sdk/s3-request-presigner": "^3.987.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.4",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1"
+  }
+}
